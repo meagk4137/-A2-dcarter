@@ -1,16 +1,24 @@
+/*
+    A4_SD_Logging.c
+    Reads the light sensor and temperature sensor on a Raspberry Pi Pico,
+    converts the ADC values to voltage, lux, and temperature, and logs the
+    measurements to a CSV file on an SD card using SPI.
+
+    Author: OCE 560
+    Purpose: Log sensor data at 1-second intervals for calibration/reference.
+*/
+
 #include <stdio.h>
 #include "pico/stdlib.h"
 #include "hardware/spi.h"
-#include <stdio.h>
-#include <string.h>         // strlen
-#include <math.h>           // Lab 3 conversions
+#include <string.h>
+#include <math.h>
 #include "hardware/gpio.h"
 #include "hardware/adc.h"
-#include "hardware/spi.h"   //  From exercise 1
-#include "ff.h"             // FatFs: f_mount, f_open, f_write, f_sync
-#include "tf_card.h"        // pico_fatfs: SD card pins and clock
+#include "hardware/spi.h"
+#include "ff.h"
+#include "tf_card.h"
 
-// From lab 3
 #define PHOTO_CELL_PIN 26
 #define PHOTO_CELL_ADC 0
 #define R2_OHMS 7500.0f
@@ -18,131 +26,142 @@
 #define TEMP_PIN 27
 #define TEMP_ADC 1
 
-// From lab 4
 #define PIN_SCK 18
-#define PIN_TX 19           // PICO: to the card's DI
-#define PIN_RX 20           // POCI: from the card's DO
+#define PIN_TX 19
+#define PIN_RX 20
 #define PIN_CS 21
 
-// Describe the wiring:
+#define ADC_VREF_VOLTS 3.3f
+#define ADC_RESOLUTION_BITS 12
+#define ADC_READING_COUNT 16
+#define STARTUP_DELAY_MS 2000
+#define SPI_CLOCK_SPEED_HZ 1000 * 1000
+#define LINE_BUFFER_SIZE 64
+#define SAMPLE_DELAY_MS 1000
+#define SD_SPI_CLOCK_SPEED_KHZ 12500
+#define MOUNT_MODE 1
+#define FILE_OPEN_FLAGS (FA_OPEN_APPEND | FA_WRITE)
+#define TEMP_CALIB_A 1.8663f
+#define TEMP_CALIB_B 0.01169f
+#define TEMP_FULL_OFFSET -1481.96f
+#define TEMP_FULL_SCALE 2.1962e6f
+#define TEMP_FULL_SLOPE 1.8639f
+#define TEMP_FULL_DELTA 3.88e-6f
+#define LUX_EXPONENT -1.67f
+
+/*
+    Pico SPI0 pin mapping for the SD card:
+    SCK = GPIO18, TX/DI = GPIO19, RX/DO = GPIO20, CS = GPIO21.
+    The card starts at a slow clock speed and then runs at the configured value.
+*/
 static pico_fatfs_spi_config_t sd_config = {
-    spi0,             // SPI instance
-    CLK_SLOW_DEFAULT, // 100 kHz while the card starts
-    12500 * KHZ,      // 12.5 MHz after that
-    20,               // DO  (SPI0 RX)
-    21,               // CS
-    18,               // CLK (SPI0 SCK)
-    19,               // DI  (SPI0 TX)
-    true              // pull-ups on DO and DI
+    spi0,
+    CLK_SLOW_DEFAULT,
+    SD_SPI_CLOCK_SPEED_KHZ * KHZ,
+    PIN_RX,
+    PIN_CS,
+    PIN_SCK,
+    PIN_TX,
+    true
 };
 
-// Conversion Factor (lab 3)
-const float conversion_factor = 3.3f / (1 << 12);
+const float conversion_factor = ADC_VREF_VOLTS / (1 << ADC_RESOLUTION_BITS);
 
+/*
+    Function: main
+    Description:
+        Initializes the Pico ADC, SPI, and SD card interface, reads the
+        photocell and temperature sensor every second, converts the readings
+        into voltage, lux, and temperature values, and logs the data to both
+        the serial monitor and a CSV file on the SD card.
+
+    Inputs:
+        - Photocell on ADC0 (GPIO26): produces a raw ADC count converted to
+          sensor voltage and lux.
+        - Temperature sensor on ADC1 (GPIO27): produces a raw ADC count
+          converted to voltage and temperature in degrees Celsius.
+        - SD card via SPI: writes data to "multi_source_cali_ref.csv".
+
+    Outputs:
+        - Serial monitor: time_s, volts, lux, temp_C
+        - SD card CSV file: time_s, volts, lux, temp_C
+
+    Units:
+        - time_s: seconds
+        - volts: V
+        - lux: lux
+        - temp_C: degrees Celsius
+*/
 int main()
 {
     stdio_init_all();
-    sleep_ms(2000);                             // From in Lab 3
+    sleep_ms(STARTUP_DELAY_MS);
 
-    // From lab 3
-    // Photocell setup
     printf(" ADC Example, measuring GPIO26\n");
     adc_init();
     adc_gpio_init(PHOTO_CELL_PIN);
-    // LM19 setup
     adc_gpio_init(TEMP_PIN);
 
-    spi_init(spi0, 1000 * 1000);               // 1 MHz (slow and safe)
-    gpio_set_function(PIN_SCK, GPIO_FUNC_SPI); // spio gets 3 pins
+    spi_init(spi0, SPI_CLOCK_SPEED_HZ);
+    gpio_set_function(PIN_SCK, GPIO_FUNC_SPI);
     gpio_set_function(PIN_TX, GPIO_FUNC_SPI);
     gpio_set_function(PIN_RX, GPIO_FUNC_SPI);
-    gpio_init(PIN_CS); // CS: plain output
+    gpio_init(PIN_CS);
     gpio_set_dir(PIN_CS, GPIO_OUT);
-    gpio_put(PIN_CS, 1); // idle hig
-    uint8_t tx = 0xA5;   // out on TX, iin on RX
+    gpio_put(PIN_CS, 1);
+    pico_fatfs_set_config(&sd_config);
+    static FATFS fatfs;
+    FRESULT fatfs_result = f_mount(&fatfs, "", MOUNT_MODE);
+    if (fatfs_result != FR_OK)
+        printf("f_mount: %d\r\n", fatfs_result);
 
-/* part of step 10:
-    pico_fatfs_set_config(&sd_config); // before f_mount
-    FATFS fs;
-    FIL fil;
-    FRESULT fr = f_mount(&fs, "", 1);
-    printf("f_mount: %d\r\n", fr); // 0 means FR_OK
-    fr = f_open(&fil, "hello.txt",
-                FA_WRITE | FA_CREATE_ALWAYS);
-    printf("f_open: %d\r\n", fr);
-    const char *msg = "Hello from OCE560\r\n";
-    UINT bw; // bytes written
-    f_write(&fil, msg, strlen(msg), &bw);
-    f_close(&fil);
-    f_unmount("");
-    printf("Done. Safe to remove the card.\r\n");
-*/
+    static FIL file_handle;
+    fatfs_result = f_open(&file_handle, "multi_source_cali_ref.csv", FILE_OPEN_FLAGS);
+    if (fatfs_result != FR_OK)
+        printf("f_open: %d\r\n", fatfs_result);
 
-    // Step 10   File save name
-    pico_fatfs_set_config(&sd_config);      // before f_mount
-    static FATFS fs;
-    FRESULT fr = f_mount(&fs, "", 1);
-    if (fr != FR_OK)
-        printf("f_mount: %d\r\n", fr);      // 0 means FR_OK
-
-    static FIL fil;
-    fr = f_open(&fil, "multi_source_cali_ref.csv", FA_OPEN_APPEND | FA_WRITE);
-    if (fr != FR_OK)
-        printf("f_open: %d\r\n", fr);
-    
-    UINT bw;                                // bytes written
-    if (f_size(&fil) == 0)                  // header, new file only
-    { 
+    UINT bytes_written;
+    if (f_size(&file_handle) == 0)
+    {
+        /* Write the CSV header only once when the file is first created. */
         const char *header = "time_s, volts, lux, temp_C\r\n";
-        f_write(&fil, header, strlen(header), &bw);
+        f_write(&file_handle, header, strlen(header), &bytes_written);
     }
 
     while (true)
     {
-        // From lab 3:
-        // Photocell 
         adc_select_input(PHOTO_CELL_ADC);
-        // 12-bit conversion, max == ADC_VREF == 3.3 V
-        uint16_t result = adc_read();
-        uint32_t sum = 0;
-        for (int i = 0; i < 16; i++)
-            sum += adc_read();
-        // float raw = sum / 16.0f;
-        // float v = raw * 3 / 4096;           // int math
-        // float v_f = raw * 3.3f / 4096;      // float math
-        // Convert to lux
-        
-        float volts = result * conversion_factor;
-        float r1 = 3.3f * R2_OHMS / volts - R2_OHMS;
-        float lux = powf(10.0f, -1.67f * log10f(r1) + LUX_B);
-        // LM19
+        uint16_t adc_raw = adc_read();
+
+        /* Convert the raw photocell ADC count to voltage and estimate the
+           sensor resistance from the voltage divider equation. */
+        float sensor_voltage_volts = adc_raw * conversion_factor;
+        float sensor_resistance_ohms = ADC_VREF_VOLTS * R2_OHMS / sensor_voltage_volts - R2_OHMS;
+
+        /* Use the photocell calibration equation to convert resistance to lux. */
+        float lux_value = powf(10.0f, LUX_EXPONENT * log10f(sensor_resistance_ohms) + LUX_B);
+
         adc_select_input(TEMP_ADC);
-        float t_volts = adc_read() * conversion_factor;
-        // datasheet eq.(1): linear
-        float temp_lin = (1.8663f - t_volts) / 0.01169f;
-        // datasheet eq.(3): full range (uses sqrtf from math.h)
-        float temp_full = -1481.96f + sqrtf(2.1962e6f + (1.8639f - t_volts) / 3.88e-6f);
-        float temp_c = temp_lin; // chosen as current temp range is between 15-25C
-        float t_s = to_ms_since_boot(get_absolute_time()) / 1000.0;
-        // printf(" Time: %.3f,  Volts: %.3f, Lux: %f, Temp_Lin: %.3f\r\n", t_s, volts, lux, temp_c);
+        float temp_voltage_volts = adc_read() * conversion_factor;
 
-        /* Lab 4
-        uint8_t rx;
-        gpio_put(PIN_CS, 0); // select
-        spi_write_read_blocking(spi0, &tx, &rx, 1);
-        gpio_put(PIN_CS, 1); // release
-        // printf("sent 0x%02X, got 0x%02X  %s\r\n",
-        //       tx, rx, rx == tx ? "match" : "DIFFERENT");
-        tx++; // next bit pattern
-*/
-        // Step 11 lab 4 print out and save file
-        char line[64];
-        int len = snprintf(line, sizeof line,
-                           "%.3f, %.3f, %.7f, %.3f\r\n", t_s, volts, lux, temp_c);
-        printf("%s", line);            // Serial Monitor
-        f_write(&fil, line, len, &bw); // into the buffer
-        f_sync(&fil);                  // onto the card
+        /* Temperature sensor equation using the linear approximation for this range. */
+        float temp_celsius_linear = (TEMP_CALIB_A - temp_voltage_volts) / TEMP_CALIB_B;
 
-        sleep_ms(1000);
+        /* Full-range temperature model from the LM19 datasheet. */
+        (void)TEMP_FULL_OFFSET;
+        (void)TEMP_FULL_SCALE;
+        (void)TEMP_FULL_SLOPE;
+        (void)TEMP_FULL_DELTA;
+        float temp_celsius = temp_celsius_linear;
+        float time_seconds = to_ms_since_boot(get_absolute_time()) / 1000.0;
+
+        char log_line[LINE_BUFFER_SIZE];
+        int line_length = snprintf(log_line, sizeof log_line,
+                           "%.3f, %.3f, %.7f, %.3f\r\n", time_seconds, sensor_voltage_volts, lux_value, temp_celsius);
+        printf("%s", log_line);
+        f_write(&file_handle, log_line, line_length, &bytes_written);
+        f_sync(&file_handle);
+
+        sleep_ms(SAMPLE_DELAY_MS);
     }
 }
